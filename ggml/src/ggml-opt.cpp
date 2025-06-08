@@ -82,14 +82,14 @@ struct ggml_opt_result {
 // ====== Dataset ======
 
 ggml_opt_dataset_t ggml_opt_dataset_init(
-        enum ggml_type type_data,
-        enum ggml_type type_label,
-        int64_t        ne_datapoint,
-        int64_t        ne_label,
-        int64_t        ndata,
-        int64_t        ndata_shard) {
+        enum ggml_type        type_data,
+        struct ggml_tensor *  hidden_state_exemplar, // New: Exemplar tensor for labels
+        int64_t               ne_datapoint,
+        int64_t               ndata,
+        int64_t               ndata_shard) {
     GGML_ASSERT(ne_datapoint >  0);
-    GGML_ASSERT(ne_label     >= 0);
+    GGML_ASSERT(hidden_state_exemplar != nullptr); // Ensure exemplar is provided
+    GGML_ASSERT(hidden_state_exemplar->ne[0] > 0); // This will be n_embd
     GGML_ASSERT(ndata        >  0);
     GGML_ASSERT(ndata_shard  >  0);
 
@@ -109,13 +109,22 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
     result->data = ggml_new_tensor_2d(result->ctx, type_data, ne_datapoint, ndata);
     result->nbs_data = ggml_nbytes(result->data) * ndata_shard/ndata;
 
-    if (ne_label > 0) {
-        result->labels = ggml_new_tensor_2d(result->ctx, type_label, ne_label, ndata);
-        result->nbs_labels = ggml_nbytes(result->labels) * ndata_shard/ndata;
-    } else {
-        result->labels = nullptr;
-        result->nbs_labels = 0;
-    }
+    // Initialize labels tensor based on hidden_state_exemplar
+    // The type is GGML_TYPE_F32 as requested.
+    // The number of elements for the label (n_embd) is taken from the exemplar.
+    // The second dimension remains 'ndata'.
+    int64_t n_embd_from_exemplar = hidden_state_exemplar->ne[0]; // Assuming n_embd is the first dimension
+    result->labels = ggml_new_tensor_2d(result->ctx, GGML_TYPE_F32, n_embd_from_exemplar, ndata);
+    result->nbs_labels = ggml_nbytes(result->labels) * ndata_shard/ndata;
+
+    // Note: The actual population of result->labels->data with hidden states
+    // needs to be done by the caller, after a forward pass of the model.
+    // This function, ggml_opt_dataset_init, only prepares the tensor structure.
+    // The caller is responsible for:
+    // 1. Defining the model and performing a forward pass for all 'ndata' items.
+    // 2. Extracting the last layer's hidden states.
+    // 3. Copying these hidden states into result->labels->data.
+    //    Example: memcpy(dataset->labels->data, computed_hidden_states_data, ggml_nbytes(dataset->labels));
 
     result->buf = ggml_backend_alloc_ctx_tensors_from_buft(result->ctx, ggml_backend_cpu_buffer_type());
 
