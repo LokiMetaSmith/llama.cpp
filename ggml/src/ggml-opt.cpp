@@ -89,7 +89,7 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
         int64_t        ndata,
         int64_t        ndata_shard) {
     GGML_ASSERT(ne_datapoint >  0);
-    GGML_ASSERT(ne_label     >= 0);
+    GGML_ASSERT(ne_label     >= 0); // Can be 0 if no labels
     GGML_ASSERT(ndata        >  0);
     GGML_ASSERT(ndata_shard  >  0);
 
