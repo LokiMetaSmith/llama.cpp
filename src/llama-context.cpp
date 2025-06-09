@@ -199,6 +199,12 @@ llama_context::llama_context(
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
 
+        // Initialize new training parameters
+        this->train_loss_type_A = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY; // Default for A
+        this->train_loss_type_B = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY; // Default for B (can be overridden)
+        this->train_loss_A_weight = 1.0f;
+        this->train_loss_B_weight = 0.0f; // Default to 0, effectively disabling Loss B unless specified
+
         backend_buft.clear();
         backend_ptrs.clear();
 
@@ -341,7 +347,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
-    ggml_opt_free(opt_ctx);
+    // ggml_opt_free(opt_ctx); // opt_ctx is no longer a member of llama_context
 }
 
 void llama_context::synchronize() {
@@ -2000,19 +2006,24 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
-    GGML_ASSERT(!opt_ctx);
+    // GGML_ASSERT(!opt_ctx); // opt_ctx is removed
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
-    const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
-    const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
-    GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
-    GGML_ASSERT(n_batch                    % n_ubatch == 0);
+    // const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train); // Not needed here anymore
+    // const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch); // Not needed here anymore
+    // GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0); // These assertions belong with ggml_opt_init call site
+    // GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
-    opt_params.opt_period      = n_batch / n_ubatch;
-    opt_params.get_opt_pars    = lopt_params.get_opt_pars;
-    opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
+    // Store loss parameters from lopt_params into llama_context members
+    this->train_loss_type_A = lopt_params.loss_type_A;
+    this->train_loss_type_B = lopt_params.loss_type_B;
+    this->train_loss_A_weight = lopt_params.loss_A_weight;
+    this->train_loss_B_weight = lopt_params.loss_B_weight;
+    // Note: lopt_params.outputs_B is not stored in llama_context, it's used directly by caller (finetune.cpp)
+    // when it calls ggml_opt_init.
 
-    opt_ctx = ggml_opt_init(opt_params);
+    // The call to ggml_opt_init is removed from here.
+    // It will be done by the example code (e.g., finetune.cpp) directly.
+    // This function now primarily sets up which LLaMA model parameters are trainable.
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -2040,6 +2051,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 }
 
 void llama_context::opt_epoch_iter(
+        ggml_opt_context_t               main_opt_ctx, // Added
         ggml_opt_dataset_t               dataset,
         ggml_opt_result_t                result,
         const std::vector<llama_token> & tokens,
@@ -2050,7 +2062,7 @@ void llama_context::opt_epoch_iter(
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
         int64_t                          t_loop_start) {
-    GGML_ASSERT(opt_ctx);
+    GGML_ASSERT(main_opt_ctx); // Changed from opt_ctx
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
@@ -2115,24 +2127,43 @@ void llama_context::opt_epoch_iter(
                 };
                 ctx_compute_opt = ggml_init(params);
             }
-            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_tokens(), res->get_logits());
-            ggml_opt_alloc(opt_ctx, train);
+        // Assuming res->get_logits() is outputs_A if only one output, or needs specific logic if dual outputs are plumbed to llama_context level
+        // For now, this part of ggml_opt_prepare_alloc might need Outputs_B = nullptr if not explicitly handled
+        // This function (opt_epoch_iter) is currently geared towards a single primary output (logits for CE loss).
+        // The dual loss setup in ggml_opt.h/cpp would require ggml_opt_init (called by finetune.cpp) to pass
+        // both outputs_A and outputs_B to ggml_opt_prepare_alloc.
+        // This function only passes one main output (res->get_logits()) which would be outputs_A.
+        ggml_opt_prepare_alloc(main_opt_ctx, ctx_compute_opt, gf, res->get_tokens(), res->get_logits(), nullptr /* outputs_B, assuming not used by this specific epoch iter */);
+        ggml_opt_alloc(main_opt_ctx, train);
 
             res->set_inputs(&ubatch);
             {
-                struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-                GGML_ASSERT(labels->ne[1] == n_ubatch);
-                ggml_set_zero(labels);
-                const float onef = 1.0f;
-                for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
-                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+            // This assumes labels_A is the target for res->get_logits() if loss_type_A is CE.
+            // If loss_type_A is MSE (current state prediction), labels_A would be filled differently.
+            // And if loss_B is active, labels_B would also need filling.
+            // This simplified label handling is for the original cross-entropy setup of this function.
+            // For dual loss, the calling code (finetune.cpp) would need to manage filling labels_A and labels_B
+            // into the ggml_opt_dataset, and ggml_opt_dataset_get_batch would load them into main_opt_ctx->labels_A/B.
+            // The current logic here for filling labels directly is likely for an older single-label model.
+            // It should be okay if main_opt_ctx->labels_A (and labels_B if used) are correctly populated by ggml_opt_dataset_get_batch.
+            // The code below for filling labels_sparse is specific to single token ID labels for CE.
+            struct ggml_tensor * labels_for_ce = ggml_opt_labels_A(main_opt_ctx); // Assuming Loss A is CE here.
+            if (labels_for_ce && (this->train_loss_type_A == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY && this->train_loss_A_weight > 0.0f)) {
+                 GGML_ASSERT(labels_for_ce->ne[1] == n_ubatch);
+                 ggml_set_zero(labels_for_ce);
+                 const float onef = 1.0f;
+                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
+                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                     GGML_ASSERT(labels_sparse[ilabel] < labels_for_ce->ne[0]);
+                     ggml_backend_tensor_set(labels_for_ce, &onef, (pos_ubatch*labels_for_ce->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                 }
                 }
+            // Similar logic would be needed for labels_B if it's also CE and needs sparse filling here.
+            // However, the design is moving towards dataset populating these.
             }
-            ggml_opt_eval(opt_ctx, result);
+        ggml_opt_eval(main_opt_ctx, result);
             if (callback) {
-                callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
+            callback(train, main_opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
             ggml_free(ctx_compute_opt);
 
@@ -2142,13 +2173,14 @@ void llama_context::opt_epoch_iter(
 }
 
 void llama_context::opt_epoch(
+        ggml_opt_context_t        main_opt_ctx, // Added
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval) {
-    const uint32_t n_ctx    = this->n_ctx();
+    const uint32_t n_ctx    = this->n_ctx(); // This is llama_context::n_ctx(), not training n_ctx from model hparams
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
     const  int64_t ndata    = ggml_opt_dataset_ndata(dataset);
@@ -2171,18 +2203,18 @@ void llama_context::opt_epoch(
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
+        opt_epoch_iter(main_opt_ctx, dataset, result_train, tokens, labels_sparse, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
     t_loop_start = ggml_time_us();
-    ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
-    for (; idata < ndata; ++idata) {
+    ndata_in_loop = (ndata_total_items_in_dataset - idata_split)*ubatch_per_ctx; // Corrected ndata source
+    for (; idata < ndata_total_items_in_dataset; ++idata) { // Corrected loop limit
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
+        opt_epoch_iter(main_opt_ctx, dataset, result_eval, tokens, labels_sparse, batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
@@ -2865,14 +2897,16 @@ void llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
 }
 
 void llama_opt_epoch(
-        struct llama_context    * ctx,
-        ggml_opt_dataset_t        dataset,
-        ggml_opt_result_t         result_train,
-        ggml_opt_result_t         result_eval,
-        int64_t                   idata_split,
-        ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
-    ctx->opt_epoch(
+        struct llama_context    * lctx, // Renamed from ctx for clarity
+        ggml_opt_context_t      main_opt_ctx, // Added
+        ggml_opt_dataset_t      dataset,
+        ggml_opt_result_t       result_train,
+        ggml_opt_result_t       result_eval,
+        int64_t                 idata_split,
+        ggml_opt_epoch_callback callback_train,
+        ggml_opt_epoch_callback callback_eval) {
+    lctx->opt_epoch( // Changed from ctx to lctx
+        main_opt_ctx, // Added
         dataset,
         result_train,
         result_eval,

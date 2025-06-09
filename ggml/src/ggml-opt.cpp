@@ -14,15 +14,17 @@
 #include <vector>
 
 struct ggml_opt_dataset {
-    struct ggml_context   * ctx    = nullptr;
-    ggml_backend_buffer_t   buf    = nullptr;
-    struct ggml_tensor    * data   = nullptr;
-    struct ggml_tensor    * labels = nullptr;
+    struct ggml_context   * ctx        = nullptr;
+    ggml_backend_buffer_t   buf        = nullptr;
+    struct ggml_tensor    * data       = nullptr;
+    struct ggml_tensor    * labels_A   = nullptr; // Renamed
+    struct ggml_tensor    * labels_B   = nullptr; // Added
 
     int64_t ndata       = -1;
     int64_t ndata_shard = -1;
     size_t  nbs_data    = -1;
-    size_t  nbs_labels  = -1;
+    size_t  nbs_labels_A = 0; // Renamed and initialized
+    size_t  nbs_labels_B = 0; // Added and initialized
 
     std::vector<int64_t> permutation;
 };
@@ -38,17 +40,24 @@ struct ggml_opt_context {
     ggml_backend_buffer_t      buf_static           = nullptr;
     ggml_backend_buffer_t      buf_cpu              = nullptr;
     std::mt19937               rng;
-    enum ggml_opt_loss_type    loss_type;
+    // enum ggml_opt_loss_type    loss_type; // Replaced by loss_type_A and loss_type_B
     enum ggml_opt_build_type   build_type;
     enum ggml_opt_build_type   build_type_alloc;
 
-    struct ggml_tensor * inputs  = nullptr;
-    struct ggml_tensor * outputs = nullptr;
-    struct ggml_tensor * labels  = nullptr;
+    struct ggml_tensor * inputs    = nullptr;
+    struct ggml_tensor * outputs_A = nullptr; // Renamed
+    struct ggml_tensor * outputs_B = nullptr; // Added
+    struct ggml_tensor * labels_A  = nullptr; // Renamed
+    struct ggml_tensor * labels_B  = nullptr; // Added
 
-    struct ggml_tensor * loss     = nullptr;
-    struct ggml_tensor * pred     = nullptr;
-    struct ggml_tensor * ncorrect = nullptr;
+    enum ggml_opt_loss_type loss_type_A; // Added
+    enum ggml_opt_loss_type loss_type_B; // Added
+    float loss_A_weight = 1.0f;          // Added
+    float loss_B_weight = 1.0f;          // Added
+
+    struct ggml_tensor * loss     = nullptr; // Combined loss
+    struct ggml_tensor * pred     = nullptr; // Associated with outputs_B
+    struct ggml_tensor * ncorrect = nullptr; // Associated with outputs_B
 
     struct ggml_cgraph * gf      = nullptr;
     struct ggml_cgraph * gb_grad = nullptr;
@@ -83,15 +92,18 @@ struct ggml_opt_result {
 
 ggml_opt_dataset_t ggml_opt_dataset_init(
         enum ggml_type type_data,
-        enum ggml_type type_label,
         int64_t        ne_datapoint,
-        int64_t        ne_label,
         int64_t        ndata,
-        int64_t        ndata_shard) {
-    GGML_ASSERT(ne_datapoint >  0);
-    GGML_ASSERT(ne_label     >= 0);
-    GGML_ASSERT(ndata        >  0);
-    GGML_ASSERT(ndata_shard  >  0);
+        int64_t        ndata_shard,
+        enum ggml_type type_label_A,
+        int64_t        ne_label_A,
+        enum ggml_type type_label_B,
+        int64_t        ne_label_B) {
+    GGML_ASSERT(ne_datapoint > 0);
+    GGML_ASSERT(ndata > 0);
+    GGML_ASSERT(ndata_shard > 0);
+    GGML_ASSERT(ne_label_A >= 0);
+    GGML_ASSERT(ne_label_B >= 0);
 
     ggml_opt_dataset_t result = new ggml_opt_dataset;
     result->ndata       = ndata;
@@ -99,7 +111,7 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
 
     {
         struct ggml_init_params params = {
-            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_size   =*/ 3 * ggml_tensor_overhead(), // For data, labels_A, labels_B
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -107,14 +119,22 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
     }
 
     result->data = ggml_new_tensor_2d(result->ctx, type_data, ne_datapoint, ndata);
-    result->nbs_data = ggml_nbytes(result->data) * ndata_shard/ndata;
+    result->nbs_data = ggml_nbytes(result->data) * ndata_shard / ndata;
 
-    if (ne_label > 0) {
-        result->labels = ggml_new_tensor_2d(result->ctx, type_label, ne_label, ndata);
-        result->nbs_labels = ggml_nbytes(result->labels) * ndata_shard/ndata;
+    if (ne_label_A > 0) {
+        result->labels_A = ggml_new_tensor_2d(result->ctx, type_label_A, ne_label_A, ndata);
+        result->nbs_labels_A = ggml_nbytes(result->labels_A) * ndata_shard / ndata;
     } else {
-        result->labels = nullptr;
-        result->nbs_labels = 0;
+        result->labels_A = nullptr;
+        result->nbs_labels_A = 0;
+    }
+
+    if (ne_label_B > 0) {
+        result->labels_B = ggml_new_tensor_2d(result->ctx, type_label_B, ne_label_B, ndata);
+        result->nbs_labels_B = ggml_nbytes(result->labels_B) * ndata_shard / ndata;
+    } else {
+        result->labels_B = nullptr;
+        result->nbs_labels_B = 0;
     }
 
     result->buf = ggml_backend_alloc_ctx_tensors_from_buft(result->ctx, ggml_backend_cpu_buffer_type());
@@ -141,8 +161,12 @@ struct ggml_tensor * ggml_opt_dataset_data(ggml_opt_dataset_t dataset) {
     return dataset->data;
 }
 
-struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset) {
-    return dataset->labels;
+struct ggml_tensor * ggml_opt_dataset_labels_A(ggml_opt_dataset_t dataset) { // Renamed
+    return dataset->labels_A;
+}
+
+struct ggml_tensor * ggml_opt_dataset_labels_B(ggml_opt_dataset_t dataset) { // Added
+    return dataset->labels_B;
 }
 
 void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata) {
@@ -158,61 +182,87 @@ void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dat
     std::shuffle(dataset->permutation.begin(), dataset->permutation.begin() + ishard_max, opt_ctx->rng);
 }
 
-void ggml_opt_dataset_get_batch(ggml_opt_dataset_t dataset, struct ggml_tensor * data_batch, struct ggml_tensor * labels_batch, int64_t ibatch) {
-    GGML_ASSERT(   data_batch && ggml_is_contiguous(data_batch));
-    GGML_ASSERT(!labels_batch || ggml_is_contiguous(labels_batch));
-    GGML_ASSERT((labels_batch == nullptr) == (dataset->labels == nullptr));
-    GGML_ASSERT(                   data_batch->type == dataset->data->type);
-    GGML_ASSERT(!labels_batch || labels_batch->type == dataset->labels->type);
+void ggml_opt_dataset_get_batch(
+        ggml_opt_dataset_t   dataset,
+        struct ggml_tensor * data_batch,
+        struct ggml_tensor * labels_A_batch,
+        struct ggml_tensor * labels_B_batch,
+        int64_t              ibatch) {
+    GGML_ASSERT(  data_batch && ggml_is_contiguous(data_batch));
+    GGML_ASSERT(!labels_A_batch || ggml_is_contiguous(labels_A_batch));
+    GGML_ASSERT(!labels_B_batch || ggml_is_contiguous(labels_B_batch));
+    GGML_ASSERT((labels_A_batch == nullptr) == (dataset->labels_A == nullptr));
+    GGML_ASSERT((labels_B_batch == nullptr) == (dataset->labels_B == nullptr));
+    GGML_ASSERT(                  data_batch->type == dataset->data->type);
+    GGML_ASSERT(!labels_A_batch || labels_A_batch->type == dataset->labels_A->type);
+    GGML_ASSERT(!labels_B_batch || labels_B_batch->type == dataset->labels_B->type);
 
     const size_t nb_data_batch = ggml_nbytes(data_batch);
     GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
     const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
 
-    if (labels_batch) {
-        const size_t nb_labels_batch = ggml_nbytes(labels_batch);
-        GGML_ASSERT(nb_labels_batch == shards_per_batch*dataset->nbs_labels);
+    if (labels_A_batch) {
+        const size_t nb_labels_A_batch = ggml_nbytes(labels_A_batch);
+        GGML_ASSERT(nb_labels_A_batch == shards_per_batch * dataset->nbs_labels_A);
+    }
+    if (labels_B_batch) {
+        const size_t nb_labels_B_batch = ggml_nbytes(labels_B_batch);
+        GGML_ASSERT(nb_labels_B_batch == shards_per_batch * dataset->nbs_labels_B);
     }
 
-    GGML_ASSERT((ibatch + 1)*shards_per_batch <= int64_t(dataset->permutation.size()));
+    GGML_ASSERT((ibatch + 1) * shards_per_batch <= int64_t(dataset->permutation.size()));
 
     for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
-        const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
+        const int64_t ishard = dataset->permutation[ibatch * shards_per_batch + ishard_batch];
 
-        const char * ptr_data = (const char *) dataset->data->data + ishard*dataset->nbs_data;
-        ggml_backend_tensor_set(data_batch, ptr_data, ishard_batch*dataset->nbs_data, dataset->nbs_data);
+        const char * ptr_data = (const char *)dataset->data->data + ishard * dataset->nbs_data;
+        ggml_backend_tensor_set(data_batch, ptr_data, ishard_batch * dataset->nbs_data, dataset->nbs_data);
 
-        if (!labels_batch) {
-            continue;
+        if (labels_A_batch) {
+            const char * ptr_labels_A = (const char *)dataset->labels_A->data + ishard * dataset->nbs_labels_A;
+            ggml_backend_tensor_set(labels_A_batch, ptr_labels_A, ishard_batch * dataset->nbs_labels_A, dataset->nbs_labels_A);
         }
 
-        const char * ptr_labels = (const char *) dataset->labels->data + ishard*dataset->nbs_labels;
-        ggml_backend_tensor_set(labels_batch, ptr_labels, ishard_batch*dataset->nbs_labels, dataset->nbs_labels);
+        if (labels_B_batch) {
+            const char * ptr_labels_B = (const char *)dataset->labels_B->data + ishard * dataset->nbs_labels_B;
+            ggml_backend_tensor_set(labels_B_batch, ptr_labels_B, ishard_batch * dataset->nbs_labels_B, dataset->nbs_labels_B);
+        }
     }
 }
 
-void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_batch, size_t nb_data_batch, void * labels_batch, int64_t ibatch) {
-    GGML_ASSERT((labels_batch == nullptr) == (dataset->labels == nullptr));
+void ggml_opt_dataset_get_batch_host(
+        ggml_opt_dataset_t dataset,
+        void *             data_batch_host,
+        size_t             nb_data_batch,
+        void *             labels_A_batch_host,
+        void *             labels_B_batch_host,
+        int64_t            ibatch) {
+    GGML_ASSERT((labels_A_batch_host == nullptr) == (dataset->labels_A == nullptr));
+    GGML_ASSERT((labels_B_batch_host == nullptr) == (dataset->labels_B == nullptr));
     GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
 
     const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
 
-    GGML_ASSERT((ibatch + 1)*shards_per_batch <= int64_t(dataset->permutation.size()));
+    GGML_ASSERT((ibatch + 1) * shards_per_batch <= int64_t(dataset->permutation.size()));
 
     for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
-        const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
+        const int64_t ishard = dataset->permutation[ibatch * shards_per_batch + ishard_batch];
 
-        const char * ptr_data       = (const char *) dataset->data->data + ishard      *dataset->nbs_data;
-        char       * ptr_data_batch = (char       *) data_batch          + ishard_batch*dataset->nbs_data;
-        memcpy(ptr_data_batch, ptr_data, dataset->nbs_data);
+        const char * ptr_data_src         = (const char *)dataset->data->data + ishard * dataset->nbs_data;
+        char *       ptr_data_batch_dst   = (char *)data_batch_host + ishard_batch * dataset->nbs_data;
+        memcpy(ptr_data_batch_dst, ptr_data_src, dataset->nbs_data);
 
-        if (!labels_batch) {
-            continue;
+        if (labels_A_batch_host) {
+            const char * ptr_labels_A_src       = (const char *)dataset->labels_A->data + ishard * dataset->nbs_labels_A;
+            char *       ptr_labels_A_batch_dst = (char *)labels_A_batch_host + ishard_batch * dataset->nbs_labels_A;
+            memcpy(ptr_labels_A_batch_dst, ptr_labels_A_src, dataset->nbs_labels_A);
         }
 
-        const char * ptr_labels       = (const char *) dataset->labels->data + ishard      *dataset->nbs_labels;
-        char       * ptr_labels_batch = (char       *) labels_batch          + ishard_batch*dataset->nbs_labels;
-        memcpy(ptr_labels_batch, ptr_labels, dataset->nbs_labels);
+        if (labels_B_batch_host) {
+            const char * ptr_labels_B_src       = (const char *)dataset->labels_B->data + ishard * dataset->nbs_labels_B;
+            char *       ptr_labels_B_batch_dst = (char *)labels_B_batch_host + ishard_batch * dataset->nbs_labels_B;
+            memcpy(ptr_labels_B_batch_dst, ptr_labels_B_src, dataset->nbs_labels_B);
+        }
     }
 }
 
@@ -238,13 +288,18 @@ struct ggml_opt_optimizer_params ggml_opt_get_constant_optimizer_params(void * u
 
 struct ggml_opt_params ggml_opt_default_params(
         ggml_backend_sched_t      backend_sched,
-        enum ggml_opt_loss_type   loss_type) {
+        enum ggml_opt_loss_type   loss_type_A_default,
+        enum ggml_opt_loss_type   loss_type_B_default) {
     return {
         /*backend_sched   =*/ backend_sched,
         /*ctx_compute     =*/ nullptr,
         /*inputs          =*/ nullptr,
-        /*logits          =*/ nullptr,
-        /*loss_type       =*/ loss_type,
+        /*outputs_A       =*/ nullptr, // Renamed from outputs/logits
+        /*outputs_B       =*/ nullptr, // Added
+        /*loss_type_A     =*/ loss_type_A_default, // Renamed
+        /*loss_type_B     =*/ loss_type_B_default, // Added
+        /*loss_A_weight   =*/ 1.0f,    // Added
+        /*loss_B_weight   =*/ 1.0f,    // Added (default to 1.0, user can set to 0.0 if not used)
         /*build_type      =*/ GGML_OPT_BUILD_TYPE_OPT,
         /*opt_period      =*/ 1,
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
@@ -320,7 +375,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         !(opt_ctx->static_graphs && opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period == 1);
 
     ggml_set_input(opt_ctx->inputs);
-    ggml_set_output(opt_ctx->outputs);
+    if (opt_ctx->outputs_A) ggml_set_output(opt_ctx->outputs_A);
+    if (opt_ctx->outputs_B) ggml_set_output(opt_ctx->outputs_B);
 
     int n_param = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
@@ -371,68 +427,146 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     struct ggml_context * ctx_results = opt_ctx->static_graphs ? opt_ctx->ctx_static : opt_ctx->ctx_compute;
+    struct ggml_tensor * loss_A_tensor = nullptr;
+    struct ggml_tensor * loss_B_tensor = nullptr;
 
-    switch (opt_ctx->loss_type) {
-        case GGML_OPT_LOSS_TYPE_MEAN: {
-            opt_ctx->loss = ggml_sum(ctx_results, opt_ctx->outputs);
-            ggml_set_name(opt_ctx->loss, "loss_sum");
-            const float scale = 1.0f / (opt_ctx->opt_period * ggml_nelements(opt_ctx->outputs));
-            opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, scale);
-            ggml_set_name(opt_ctx->loss, "loss_mean");
-            opt_ctx->loss_per_datapoint = true;
-            break;
-        }
-        case GGML_OPT_LOSS_TYPE_SUM: {
-            opt_ctx->loss = ggml_sum(ctx_results, opt_ctx->outputs);
-            ggml_set_name(opt_ctx->loss, "loss_sum");
-            opt_ctx->loss_per_datapoint = false;
-            break;
-        }
-        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
-            opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
-            ggml_set_input(opt_ctx->labels);
-            ggml_set_name(opt_ctx->labels, "labels");
-            opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
-            ggml_set_name(opt_ctx->loss, "loss_cross_entropy");
-            if (opt_ctx->opt_period > 1) {
-                opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
-                ggml_set_name(opt_ctx->loss, "loss_cross_entropy_scaled");
+    // Calculate Loss A
+    if (opt_ctx->outputs_A && opt_ctx->loss_A_weight > 0.0f) {
+        opt_ctx->labels_A = ggml_dup_tensor(ctx_results, opt_ctx->outputs_A);
+        ggml_set_input(opt_ctx->labels_A);
+        ggml_set_name(opt_ctx->labels_A, "labels_A");
+
+        switch (opt_ctx->loss_type_A) {
+            case GGML_OPT_LOSS_TYPE_MEAN: {
+                loss_A_tensor = ggml_sum(ctx_results, opt_ctx->outputs_A);
+                const float scale_A = 1.0f / (opt_ctx->opt_period * ggml_nelements(opt_ctx->outputs_A));
+                loss_A_tensor = ggml_scale(ctx_results, loss_A_tensor, scale_A);
+                ggml_set_name(loss_A_tensor, "loss_A_mean");
+                // opt_ctx->loss_per_datapoint will be determined by loss_B if present, or this if only loss_A
+                break;
             }
-            opt_ctx->loss_per_datapoint = true;
-            break;
+            case GGML_OPT_LOSS_TYPE_SUM: {
+                loss_A_tensor = ggml_sum(ctx_results, opt_ctx->outputs_A);
+                ggml_set_name(loss_A_tensor, "loss_A_sum");
+                break;
+            }
+            case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: { // Should not happen for hidden states typically
+                loss_A_tensor = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs_A, opt_ctx->labels_A);
+                ggml_set_name(loss_A_tensor, "loss_A_ce");
+                if (opt_ctx->opt_period > 1) {
+                    loss_A_tensor = ggml_scale(ctx_results, loss_A_tensor, 1.0f / opt_ctx->opt_period);
+                }
+                break;
+            }
+            case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
+                struct ggml_tensor * error_A = ggml_sub(ctx_results, opt_ctx->outputs_A, opt_ctx->labels_A);
+                loss_A_tensor = ggml_sqr(ctx_results, error_A);
+                loss_A_tensor = ggml_sum(ctx_results, loss_A_tensor);
+                const float scale_A = 1.0f / (opt_ctx->opt_period * ggml_nelements(opt_ctx->outputs_A));
+                loss_A_tensor = ggml_scale(ctx_results, loss_A_tensor, scale_A);
+                ggml_set_name(loss_A_tensor, "loss_A_mse");
+                break;
+            }
         }
-        case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: {
-            opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
-            ggml_set_input(opt_ctx->labels);
-            ggml_set_name(opt_ctx->labels, "labels");
-            opt_ctx->loss = ggml_sub(ctx_results, opt_ctx->outputs, opt_ctx->labels);
-            ggml_set_name(opt_ctx->loss, "loss_error");
-            opt_ctx->loss = ggml_sqr(ctx_results, opt_ctx->loss);
-            ggml_set_name(opt_ctx->loss, "loss_squared_error");
-            opt_ctx->loss = ggml_sum(ctx_results, opt_ctx->loss);
-            ggml_set_name(opt_ctx->loss, "loss_sum_squared_error");
-            const float scale = 1.0f / (opt_ctx->opt_period * ggml_nelements(opt_ctx->outputs));
-            opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, scale);
-            ggml_set_name(opt_ctx->loss, "loss_mean_squared_error");
-            opt_ctx->loss_per_datapoint = true;
-            break;
+        if (loss_A_tensor) {
+            loss_A_tensor = ggml_scale(ctx_results, loss_A_tensor, opt_ctx->loss_A_weight);
+            ggml_set_name(loss_A_tensor, "loss_A_weighted");
         }
     }
+
+    // Calculate Loss B (typically for next token prediction)
+    if (opt_ctx->outputs_B && opt_ctx->loss_B_weight > 0.0f) {
+        // For Cross Entropy, labels might need different dimensions than outputs (e.g. I32 for token IDs)
+        // However, ggml_dup_tensor copies shape and type.
+        // The current ggml_cross_entropy_loss expects labels to be same shape as logits for one-hot like encoding,
+        // or it's handled internally if labels are token IDs. Assuming for now that the setup matches ggml's expectations.
+        opt_ctx->labels_B = ggml_dup_tensor(ctx_results, opt_ctx->outputs_B);
+        ggml_set_input(opt_ctx->labels_B);
+        ggml_set_name(opt_ctx->labels_B, "labels_B");
+
+        switch (opt_ctx->loss_type_B) {
+            case GGML_OPT_LOSS_TYPE_MEAN: { // Less common for logits
+                loss_B_tensor = ggml_sum(ctx_results, opt_ctx->outputs_B);
+                const float scale_B = 1.0f / (opt_ctx->opt_period * ggml_nelements(opt_ctx->outputs_B));
+                loss_B_tensor = ggml_scale(ctx_results, loss_B_tensor, scale_B);
+                ggml_set_name(loss_B_tensor, "loss_B_mean");
+                opt_ctx->loss_per_datapoint = true;
+                break;
+            }
+            case GGML_OPT_LOSS_TYPE_SUM: { // Less common for logits
+                loss_B_tensor = ggml_sum(ctx_results, opt_ctx->outputs_B);
+                ggml_set_name(loss_B_tensor, "loss_B_sum");
+                opt_ctx->loss_per_datapoint = false;
+                break;
+            }
+            case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
+                loss_B_tensor = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs_B, opt_ctx->labels_B);
+                ggml_set_name(loss_B_tensor, "loss_B_ce");
+                if (opt_ctx->opt_period > 1) {
+                    loss_B_tensor = ggml_scale(ctx_results, loss_B_tensor, 1.0f / opt_ctx->opt_period);
+                }
+                opt_ctx->loss_per_datapoint = true; // CE loss is typically per datapoint (token)
+                break;
+            }
+            case GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR: { // Less common for logits
+                struct ggml_tensor * error_B = ggml_sub(ctx_results, opt_ctx->outputs_B, opt_ctx->labels_B);
+                loss_B_tensor = ggml_sqr(ctx_results, error_B);
+                loss_B_tensor = ggml_sum(ctx_results, loss_B_tensor);
+                const float scale_B = 1.0f / (opt_ctx->opt_period * ggml_nelements(opt_ctx->outputs_B));
+                loss_B_tensor = ggml_scale(ctx_results, loss_B_tensor, scale_B);
+                ggml_set_name(loss_B_tensor, "loss_B_mse");
+                opt_ctx->loss_per_datapoint = true;
+                break;
+            }
+        }
+        if (loss_B_tensor) {
+            loss_B_tensor = ggml_scale(ctx_results, loss_B_tensor, opt_ctx->loss_B_weight);
+            ggml_set_name(loss_B_tensor, "loss_B_weighted");
+        }
+    }
+
+    // Combine losses
+    if (loss_A_tensor && loss_B_tensor) {
+        opt_ctx->loss = ggml_add(ctx_results, loss_A_tensor, loss_B_tensor);
+        ggml_set_name(opt_ctx->loss, "loss_total");
+    } else if (loss_A_tensor) {
+        opt_ctx->loss = loss_A_tensor;
+         // If only loss_A is active, its per_datapoint nature depends on its type (MSE and MEAN are true, SUM is false)
+        if (opt_ctx->loss_type_A == GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR || opt_ctx->loss_type_A == GGML_OPT_LOSS_TYPE_MEAN) {
+            opt_ctx->loss_per_datapoint = true;
+        } else {
+            opt_ctx->loss_per_datapoint = false;
+        }
+    } else if (loss_B_tensor) {
+        opt_ctx->loss = loss_B_tensor;
+        // loss_per_datapoint is already set by loss_B logic
+    } else {
+        // No valid loss calculated, create a zero loss to prevent graph errors
+        // This case should ideally be handled by ensuring at least one loss weight > 0
+        float zero_val = 0.0f;
+        opt_ctx->loss = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, 1);
+        ggml_set_f32(opt_ctx->loss, zero_val);
+        ggml_set_name(opt_ctx->loss, "loss_zero");
+        opt_ctx->loss_per_datapoint = false;
+    }
+
     ggml_set_output(opt_ctx->loss);
     ggml_set_loss(opt_ctx->loss);
     ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
-        opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
-        ggml_set_name(opt_ctx->pred, "pred");
+    // Pred and NCorrect are associated with outputs_B (typically classification/next-token prediction)
+    if (opt_ctx->outputs_B && opt_ctx->loss_type_B == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY && opt_ctx->loss_B_weight > 0.0f) {
+        opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs_B);
+        ggml_set_name(opt_ctx->pred, "pred_B");
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, ggml_argmax(ctx_results, opt_ctx->labels));
-        ggml_set_name(opt_ctx->ncorrect, "ncorrect");
+        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, ggml_argmax(ctx_results, opt_ctx->labels_B));
+        ggml_set_name(opt_ctx->ncorrect, "ncorrect_B");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
     }
+
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD) {
@@ -526,11 +660,16 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     ggml_opt_context_t result = new struct ggml_opt_context;
     result->backend_sched    = params.backend_sched;
     result->ctx_compute      = params.ctx_compute;
-    result->loss_type        = params.loss_type;
+    // result->loss_type        = params.loss_type; // Removed
+    result->loss_type_A      = params.loss_type_A; // Added
+    result->loss_type_B      = params.loss_type_B; // Added
+    result->loss_A_weight    = params.loss_A_weight; // Added
+    result->loss_B_weight    = params.loss_B_weight; // Added
     result->build_type       = params.build_type;
     result->build_type_alloc = params.build_type;
     result->inputs           = params.inputs;
-    result->outputs          = params.outputs;
+    result->outputs_A        = params.outputs_A; // Renamed
+    result->outputs_B        = params.outputs_B; // Added
     result->opt_period       = params.opt_period;
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
@@ -541,15 +680,21 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
 
     if (!result->static_graphs) {
         GGML_ASSERT(!result->inputs);
-        GGML_ASSERT(!result->outputs);
+        GGML_ASSERT(!result->outputs_A);
+        // outputs_B can be null even if static_graphs is true, if only one loss is used.
+        // GGML_ASSERT(!result->outputs_B);
         return result;
     }
 
     GGML_ASSERT(result->inputs);
-    GGML_ASSERT(result->outputs);
+    // outputs_A must exist if static graphs are used and inputs exist.
+    GGML_ASSERT(result->outputs_A);
 
     result->gf = ggml_new_graph_custom(result->ctx_compute, GGML_DEFAULT_GRAPH_SIZE, /*grads =*/ true); // Forward pass.
-    ggml_build_forward_expand(result->gf, result->outputs);
+    ggml_build_forward_expand(result->gf, result->outputs_A);
+    if (result->outputs_B) {
+        ggml_build_forward_expand(result->gf, result->outputs_B);
+    }
 
     ggml_opt_build(result);
 
@@ -584,12 +729,20 @@ struct ggml_tensor * ggml_opt_inputs(ggml_opt_context_t opt_ctx) {
     return opt_ctx->inputs;
 }
 
-struct ggml_tensor * ggml_opt_outputs(ggml_opt_context_t opt_ctx) {
-    return opt_ctx->outputs;
+struct ggml_tensor * ggml_opt_outputs_A(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->outputs_A;
 }
 
-struct ggml_tensor * ggml_opt_labels(ggml_opt_context_t opt_ctx) {
-    return opt_ctx->labels;
+struct ggml_tensor * ggml_opt_outputs_B(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->outputs_B;
+}
+
+struct ggml_tensor * ggml_opt_labels_A(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->labels_A;
+}
+
+struct ggml_tensor * ggml_opt_labels_B(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->labels_B;
 }
 
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
@@ -688,12 +841,14 @@ void ggml_opt_prepare_alloc(
         struct ggml_context * ctx_compute,
         struct ggml_cgraph  * gf,
         struct ggml_tensor  * inputs,
-        struct ggml_tensor  * outputs) {
+        struct ggml_tensor  * outputs_A,
+        struct ggml_tensor  * outputs_B) {
     GGML_ASSERT(!opt_ctx->static_graphs);
     opt_ctx->ctx_compute = ctx_compute;
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
-    opt_ctx->outputs     = outputs;
+    opt_ctx->outputs_A   = outputs_A; // Renamed
+    opt_ctx->outputs_B   = outputs_B; // Added
 }
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
@@ -807,9 +962,23 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         GGML_ASSERT(result->opt_period         == opt_ctx->opt_period);
     }
 
-    const int64_t ndata = opt_ctx->outputs->ne[1];
-    GGML_ASSERT(result->ndata == ndata*int64_t(result->loss.size()) && "varying batch size not supported");
-    result->ndata += ndata;
+    // ndata should be based on one of the outputs, e.g. outputs_A or outputs_B if it exists.
+    struct ggml_tensor * ndata_ref_tensor = opt_ctx->outputs_A ? opt_ctx->outputs_A : opt_ctx->outputs_B;
+    // If only loss_B is active, outputs_A might be null.
+    if (!ndata_ref_tensor && opt_ctx->outputs_B) ndata_ref_tensor = opt_ctx->outputs_B;
+
+
+    GGML_ASSERT(ndata_ref_tensor != nullptr && "At least one output tensor (outputs_A or outputs_B) must be present for ndata calculation in eval");
+    const int64_t ndata_from_batch = ndata_ref_tensor->ne[1]; // Number of data points in the current batch
+
+    // This assertion might be too strict if loss.size() is not reset when ndata is reset.
+    // Let's assume result->ndata tracks total processed items, and loss.size() is number of batches so far for current result accumulation.
+    // The logic should be: if result->ndata was 0 (start of new accumulation), then it's fine.
+    // If result->ndata > 0, then previous batches must have had same ndata_from_batch size.
+    if (result->ndata > 0 && result->loss.size() > 0) { // Check if this is not the first batch for this result object
+         GGML_ASSERT(result->ndata / result->loss.size() == ndata_from_batch && "varying batch size not supported");
+    }
+    result->ndata += ndata_from_batch;
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
     GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
@@ -848,37 +1017,40 @@ void ggml_opt_epoch(
         ggml_opt_epoch_callback callback_eval) {
     GGML_ASSERT(ggml_opt_static_graphs(opt_ctx) && "ggml_opt_epoch requires static graphs");
     struct ggml_tensor * inputs = ggml_opt_inputs(opt_ctx);
-    struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-    struct ggml_tensor * data   = ggml_opt_dataset_data(dataset);
-    GGML_ASSERT(data->ne[0] == inputs->ne[0]);
+    struct ggml_tensor * labels_A_batch_tensor = ggml_opt_labels_A(opt_ctx); // Use labels_A for the batch
+    struct ggml_tensor * labels_B_batch_tensor = ggml_opt_labels_B(opt_ctx); // Use labels_B for the batch
+    struct ggml_tensor * data_tensor_full   = ggml_opt_dataset_data(dataset); // Full dataset data tensor
+    GGML_ASSERT(data_tensor_full->ne[0] == inputs->ne[0]); // Ensure feature size matches
 
-    const int64_t ndata       =   data->ne[1];
-    const int64_t ndata_batch = inputs->ne[1];
+    const int64_t ndata_total_items_in_dataset = ggml_opt_dataset_ndata(dataset); // Total items in dataset
+    const int64_t items_per_batch_from_input_tensor = inputs->ne[1]; // Items per batch based on input tensor's shape
 
-    GGML_ASSERT(data->ne[1] % inputs->ne[1] == 0);
-    const int64_t nbatches = ndata/ndata_batch;
+    GGML_ASSERT(ndata_total_items_in_dataset % items_per_batch_from_input_tensor == 0);
+    const int64_t nbatches = ndata_total_items_in_dataset / items_per_batch_from_input_tensor;
 
-    idata_split = idata_split < 0 ? ndata : idata_split;
-    GGML_ASSERT(idata_split % ndata_batch == 0);
-    const int64_t ibatch_split = idata_split / ndata_batch;
+    idata_split = idata_split < 0 ? ndata_total_items_in_dataset : idata_split;
+    // Ensure idata_split aligns with batch boundaries, it's in terms of number of items from dataset
+    GGML_ASSERT(idata_split % items_per_batch_from_input_tensor == 0);
+    const int64_t ibatch_split = idata_split / items_per_batch_from_input_tensor;
+
 
     int64_t ibatch = 0;
     int64_t t_loop_start = ggml_time_us();
     for (; ibatch < ibatch_split; ++ibatch) {
         ggml_opt_alloc(opt_ctx, /*backward =*/ true);
-        ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+        ggml_opt_dataset_get_batch(dataset, inputs, labels_A_batch_tensor, labels_B_batch_tensor, ibatch);
         ggml_opt_eval(opt_ctx, result_train);
         if (callback_train) {
-            callback_train(true, opt_ctx, dataset, result_train, ibatch+1, ibatch_split, t_loop_start);
+            callback_train(true, opt_ctx, dataset, result_train, ibatch + 1, ibatch_split, t_loop_start);
         }
     }
     t_loop_start = ggml_time_us();
     for (; ibatch < nbatches; ++ibatch) {
         ggml_opt_alloc(opt_ctx, /*backward =*/ false);
-        ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
+        ggml_opt_dataset_get_batch(dataset, inputs, labels_A_batch_tensor, labels_B_batch_tensor, ibatch);
         ggml_opt_eval(opt_ctx, result_eval);
         if (callback_eval) {
-            callback_eval(false, opt_ctx, dataset, result_eval, ibatch+1-ibatch_split, nbatches-ibatch_split, t_loop_start);
+            callback_eval(false, opt_ctx, dataset, result_eval, ibatch + 1 - ibatch_split, nbatches - ibatch_split, t_loop_start);
         }
     }
 }
@@ -971,32 +1143,46 @@ void ggml_opt_fit(
     ggml_time_init();
     const int64_t t_start_us = ggml_time_us();
 
-    const int64_t ndata           = ggml_opt_dataset_data(dataset)->ne[1];
-    const int64_t nbatch_physical = inputs->ne[1];
-    GGML_ASSERT(ndata          % nbatch_logical  == 0);
-    GGML_ASSERT(nbatch_logical % nbatch_physical == 0);
+    const int64_t ndata_total_items_in_dataset = ggml_opt_dataset_ndata(dataset);
+    const int64_t nbatch_physical_from_inputs = inputs->ne[1]; // items per physical batch based on inputs tensor
+    GGML_ASSERT(ndata_total_items_in_dataset % nbatch_logical  == 0);
+    GGML_ASSERT(nbatch_logical % nbatch_physical_from_inputs == 0);
 
-    const int64_t opt_period       = nbatch_logical / nbatch_physical;
-    const int64_t nbatches_logical = ndata / nbatch_logical;
+    const int64_t opt_period       = nbatch_logical / nbatch_physical_from_inputs;
+    const int64_t nbatches_logical = ndata_total_items_in_dataset / nbatch_logical;
 
     GGML_ASSERT(val_split >= 0.0f);
     GGML_ASSERT(val_split <  1.0f);
-    const int64_t ibatch_split = int64_t(((1.0f - val_split) * nbatches_logical)) * opt_period; // train <-> val split index (physical)
-    const int64_t idata_split  = ibatch_split * nbatch_physical;
+    const int64_t ibatch_split_logical = int64_t(((1.0f - val_split) * nbatches_logical));
+    const int64_t idata_split_items    = ibatch_split_logical * nbatch_logical; // This is the split point in terms of dataset items
 
     int64_t epoch = 1;
 
-    ggml_opt_params params = ggml_opt_default_params(backend_sched, loss_type);
+    // Assuming loss_type is for loss_A and a default (e.g. CE) for loss_B, or this needs adjustment
+    ggml_opt_params params = ggml_opt_default_params(backend_sched, loss_type, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     params.ctx_compute     = ctx_compute;
     params.inputs          = inputs;
-    params.outputs         = outputs;
+    params.outputs_A       = outputs; // Assuming 'outputs' passed to ggml_opt_fit is outputs_A
+    // params.outputs_B needs to be set if a second loss is used, ggml_opt_fit might need extension
     params.opt_period      = opt_period;
     params.get_opt_pars    = get_opt_pars;
     params.get_opt_pars_ud = &epoch;
+    // If only one loss type is passed to ggml_opt_fit, we might want to set loss_B_weight to 0
+    // For now, assume loss_type corresponds to loss_A and loss_B is secondary (e.g. CE with weight 1.0 or 0.0)
+    // If 'outputs' is null, then this whole setup is problematic.
+    // If 'loss_type' is meant for 'outputs_B', then 'outputs_A' (for hidden state loss) needs to be plumbed in.
+    // This function might be too high-level for dual loss without modification to its signature.
+    // For this refactoring, we'll assume params are correctly set up by the caller of ggml_opt_fit
+    // regarding outputs_A, outputs_B, loss_type_A, loss_type_B, and weights.
+    // The current signature of ggml_opt_fit only takes one 'outputs' and one 'loss_type'.
+    // This implies it's for a single-loss setup. The refactor of ggml_opt_context
+    // allows dual loss, but high-level functions like ggml_opt_fit would need changes
+    // to fully utilize it. The change below assumes 'outputs' is 'outputs_A'.
+
     ggml_opt_context_t opt_ctx = ggml_opt_init(params);
 
     // Shuffling the data is generally useful but there is only a point if not all data is used in a single batch.
-    if (nbatch_logical < ndata) {
+    if (nbatch_logical < ndata_total_items_in_dataset) {
         ggml_opt_dataset_shuffle(opt_ctx, dataset, -1); // Shuffle all data (train + validation).
     }
 

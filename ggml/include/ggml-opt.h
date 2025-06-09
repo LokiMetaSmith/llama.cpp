@@ -37,18 +37,22 @@ extern "C" {
     // ====== Dataset ======
 
     GGML_API ggml_opt_dataset_t ggml_opt_dataset_init(
-            enum ggml_type type_data,    // the type for the internal data tensor
-            enum ggml_type type_label,   // the type for the internal labels tensor
-            int64_t        ne_datapoint, // number of elements per datapoint
-            int64_t        ne_label,     // number of elements per label
-            int64_t        ndata,        // total number of datapoints/labels
-            int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+            enum ggml_type type_data,
+            int64_t        ne_datapoint,
+            int64_t        ndata,
+            int64_t        ndata_shard,
+            enum ggml_type type_label_A, // New
+            int64_t        ne_label_A,   // New
+            enum ggml_type type_label_B, // New
+            int64_t        ne_label_B    // New
+    );
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data
     GGML_API int64_t              ggml_opt_dataset_ndata (ggml_opt_dataset_t dataset);
     GGML_API struct ggml_tensor * ggml_opt_dataset_data  (ggml_opt_dataset_t dataset); // shape = [ne_datapoint, ndata]
-    GGML_API struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset); // shape = [nd_label,     ndata]
+    GGML_API struct ggml_tensor * ggml_opt_dataset_labels_A(ggml_opt_dataset_t dataset); // Renamed, shape = [ne_label_A, ndata]
+    GGML_API struct ggml_tensor * ggml_opt_dataset_labels_B(ggml_opt_dataset_t dataset); // Added, shape = [ne_label_B, ndata]
 
     // shuffle idata first datapoints from dataset with RNG from opt_ctx, shuffle all datapoints if idata is negative
     GGML_API void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata);
@@ -56,14 +60,16 @@ extern "C" {
     // get batch at position ibatch from dataset and copy the data to data_batch and labels_batch
     GGML_API void ggml_opt_dataset_get_batch(
             ggml_opt_dataset_t   dataset,
-            struct ggml_tensor * data_batch,   // shape = [ne_datapoint, ndata_batch]
-            struct ggml_tensor * labels_batch, // shape = [ne_label,     ndata_batch]
+            struct ggml_tensor * data_batch,
+            struct ggml_tensor * labels_A_batch, // Renamed
+            struct ggml_tensor * labels_B_batch, // Added
             int64_t              ibatch);
     GGML_API void ggml_opt_dataset_get_batch_host(
             ggml_opt_dataset_t   dataset,
             void               * data_batch,
             size_t               nb_data_batch,
-            void               * labels_batch,
+            void               * labels_A_batch_host, // Renamed
+            void               * labels_B_batch_host, // Added
             int64_t              ibatch);
 
     // ====== Model / Context ======
@@ -105,9 +111,14 @@ extern "C" {
         // if ctx_compute, inputs, and outputs are set the graphs are instead allocated statically
         struct ggml_context * ctx_compute;
         struct ggml_tensor  * inputs;
-        struct ggml_tensor  * outputs;
+        struct ggml_tensor  * outputs_A;    // Renamed
+        struct ggml_tensor  * outputs_B;    // Added
 
-        enum ggml_opt_loss_type  loss_type;
+        enum ggml_opt_loss_type  loss_type_A;  // Renamed
+        enum ggml_opt_loss_type  loss_type_B;  // Added
+        float loss_A_weight;                 // Added
+        float loss_B_weight;                 // Added
+
         enum ggml_opt_build_type build_type;
 
         int32_t opt_period; // after how many gradient accumulation steps an optimizer step should be done
@@ -120,7 +131,9 @@ extern "C" {
     // parameters for which no sensible defaults exist are supplied as arguments to this function
     GGML_API struct ggml_opt_params ggml_opt_default_params(
             ggml_backend_sched_t    backend_sched,
-            enum ggml_opt_loss_type loss_type);
+            enum ggml_opt_loss_type loss_type_A_default, // Changed argument name
+            enum ggml_opt_loss_type loss_type_B_default  // Added argument
+            );
 
     GGML_API ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params);
     GGML_API void ggml_opt_free(ggml_opt_context_t opt_ctx);
@@ -132,12 +145,14 @@ extern "C" {
 
     // get underlying tensors that store data
     // if not using static graphs these pointers become invalid with the next call to ggml_opt_alloc
-    GGML_API struct ggml_tensor * ggml_opt_inputs(  ggml_opt_context_t opt_ctx); // forward graph input tensor
-    GGML_API struct ggml_tensor * ggml_opt_outputs( ggml_opt_context_t opt_ctx); // forward graph output tensor
-    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx); // labels to compare outputs against
-    GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
-    GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
-    GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels
+    GGML_API struct ggml_tensor * ggml_opt_inputs(    ggml_opt_context_t opt_ctx); // forward graph input tensor
+    GGML_API struct ggml_tensor * ggml_opt_outputs_A( ggml_opt_context_t opt_ctx); // Renamed: forward graph output tensor A
+    GGML_API struct ggml_tensor * ggml_opt_outputs_B( ggml_opt_context_t opt_ctx); // Added: forward graph output tensor B
+    GGML_API struct ggml_tensor * ggml_opt_labels_A(  ggml_opt_context_t opt_ctx); // Renamed: labels for outputs_A
+    GGML_API struct ggml_tensor * ggml_opt_labels_B(  ggml_opt_context_t opt_ctx); // Added: labels for outputs_B
+    GGML_API struct ggml_tensor * ggml_opt_loss(      ggml_opt_context_t opt_ctx); // scalar tensor that contains the combined loss
+    GGML_API struct ggml_tensor * ggml_opt_pred(      ggml_opt_context_t opt_ctx); // predictions (associated with outputs_B)
+    GGML_API struct ggml_tensor * ggml_opt_ncorrect(  ggml_opt_context_t opt_ctx); // number of matching predictions (associated with outputs_B)
 
     // get the gradient accumulator for a node from the forward graph
     GGML_API struct ggml_tensor * ggml_opt_grad_acc(ggml_opt_context_t opt_ctx, struct ggml_tensor * node);
@@ -162,7 +177,9 @@ extern "C" {
         struct ggml_context * ctx_compute,
         struct ggml_cgraph  * gf,
         struct ggml_tensor  * inputs,
-        struct ggml_tensor  * outputs);
+        struct ggml_tensor  * outputs_A, // Renamed
+        struct ggml_tensor  * outputs_B  // Added
+        );
 
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval

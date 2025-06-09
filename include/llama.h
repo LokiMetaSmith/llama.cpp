@@ -1456,18 +1456,25 @@ extern "C" {
 
         ggml_opt_get_optimizer_params get_opt_pars; // callback for calculating optimizer parameters
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
+
+        enum ggml_opt_loss_type loss_type_A; // Renamed from loss_type
+        enum ggml_opt_loss_type loss_type_B; // Added
+        float loss_A_weight;                 // Added
+        float loss_B_weight;                 // Added
+        struct ggml_tensor * outputs_B;      // Added: To be set by caller for second loss output
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
-            ggml_opt_dataset_t        dataset,
-            ggml_opt_result_t         result_train,
-            ggml_opt_result_t         result_eval,
-            int64_t                   idata_split,
-            ggml_opt_epoch_callback   callback_train,
-            ggml_opt_epoch_callback   callback_eval);
+            ggml_opt_context_t      main_opt_ctx, // New parameter
+            ggml_opt_dataset_t      dataset,
+            ggml_opt_result_t       result_train,
+            ggml_opt_result_t       result_eval,
+            int64_t                 idata_split,
+            ggml_opt_epoch_callback callback_train,
+            ggml_opt_epoch_callback callback_eval);
 
 #ifdef __cplusplus
 }

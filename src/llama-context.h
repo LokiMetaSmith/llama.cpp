@@ -259,7 +259,11 @@ private:
     ggml_context_ptr ctx_compute;
 
     // training
-    ggml_opt_context_t opt_ctx = nullptr;
+    // ggml_opt_context_t opt_ctx = nullptr; // Removed: opt_ctx will be managed by the caller (e.g. finetune.cpp)
+    enum ggml_opt_loss_type train_loss_type_A; // Added
+    enum ggml_opt_loss_type train_loss_type_B; // Added
+    float train_loss_A_weight;                 // Added
+    float train_loss_B_weight;                 // Added
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
