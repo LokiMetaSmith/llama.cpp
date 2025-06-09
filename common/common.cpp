@@ -1523,10 +1523,18 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
     const int64_t ne_datapoint = llama_n_ctx(ctx);
     const int64_t ndata        = (tokens.size() - ne_datapoint - 1) / stride;
     ggml_opt_dataset_t result = ggml_opt_dataset_init(
-        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1);
+        /*type_data    =*/ GGML_TYPE_I32,
+        /*ne_datapoint =*/ ne_datapoint,
+        /*ndata        =*/ ndata,
+        /*ndata_shard  =*/ 1,                 // All data in one shard
+        /*type_label_A =*/ GGML_TYPE_I32,    // Assuming labels are token IDs, use this for labels_A
+        /*ne_label_A   =*/ ne_datapoint,     // Assuming label sequence length matches data point length
+        /*type_label_B =*/ GGML_TYPE_I32,    // Dummy type for unused labels_B
+        /*ne_label_B   =*/ 0                 // ne_label_B = 0 means labels_B will be null
+    );
 
     llama_token * data   = (llama_token *) ggml_opt_dataset_data(result)->data;
-    llama_token * labels = (llama_token *) ggml_opt_dataset_labels(result)->data;
+    llama_token * labels = (llama_token *) ggml_opt_dataset_labels_A(result)->data; // Use labels_A
 
     for (int64_t idata = 0; idata < ndata; ++idata) {
         memcpy(data   + idata*ne_datapoint, tokens.data() + idata*stride + 0, ne_datapoint*sizeof(llama_token));

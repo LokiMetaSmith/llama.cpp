@@ -36,7 +36,6 @@ enum llm_ffn_op_type {
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
-    LLM_FFN_GEGLU,
 };
 
 enum llm_ffn_gate_type {

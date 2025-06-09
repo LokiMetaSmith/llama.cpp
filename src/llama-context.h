@@ -155,6 +155,7 @@ struct llama_context {
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
     void opt_epoch(
+            ggml_opt_context_t      main_opt_ctx, // Added
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
             ggml_opt_result_t       result_eval,
@@ -163,6 +164,7 @@ struct llama_context {
             ggml_opt_epoch_callback callback_eval);
 
     void opt_epoch_iter(
+            ggml_opt_context_t               main_opt_ctx, // Added
             ggml_opt_dataset_t               dataset,
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,

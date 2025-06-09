@@ -127,7 +127,7 @@ int main(int argc, char ** argv) {
             // However, this chunk's hidden states will be missing or incorrect.
             // For simplicity, we'll insert zeros and continue, but real error handling might be needed.
             all_hidden_states_data.insert(all_hidden_states_data.end(), (size_t)n_tokens_chunk * n_embd, 0.0f);
-            tokens_processed_for_hidden_states.push_back(n_tokens_chunk);
+            // tokens_processed_for_hidden_states.push_back(n_tokens_chunk); // Removed usage
             continue;
         }
         llama_synchronize(ctx.get()); // Ensure computation is finished before getting embeddings
@@ -145,7 +145,7 @@ int main(int argc, char ** argv) {
             all_hidden_states_data.insert(all_hidden_states_data.end(), (size_t)n_tokens_chunk * n_embd, 0.0f);
              LOG_WRN("%s: Using zeros as placeholder for this chunk.\n", __func__);
         }
-        tokens_processed_for_hidden_states.push_back(n_tokens_chunk);
+        // tokens_processed_for_hidden_states.push_back(n_tokens_chunk); // Removed usage
     }
 
     if (all_hidden_states_data.empty() && !all_tokens_vector.empty()) { // Check if tokens existed but no HS data
@@ -161,7 +161,7 @@ int main(int argc, char ** argv) {
     // Ensure all_hidden_states_data has content for all_tokens_vector[0...n_total_trainable_tokens-1]
     // The hidden state collection loop should have populated this for all tokens processed.
     // We only use the first n_total_trainable_tokens worth of hidden states.
-    if (all_hidden_states_data.size() < n_total_trainable_tokens * n_embd) {
+    if (all_hidden_states_data.size() < (size_t)(n_total_trainable_tokens * n_embd)) { // Cast for comparison
         LOG_ERR("%s: Mismatch between collected hidden states (%zu floats) and required for trainable tokens (expected %" PRId64 " floats).\n",
                 __func__, all_hidden_states_data.size(), n_total_trainable_tokens * n_embd);
         return 1;
@@ -194,30 +194,35 @@ int main(int argc, char ** argv) {
     memcpy(dataset_labels_B_tensor->data, next_token_labels_vector.data(), n_total_trainable_tokens * sizeof(llama_token));
     LOG_INF("%s: Dataset labels_B (next tokens) populated.\n", __func__);
 
-    // Step 4 & 5: Initialize ggml_opt_context and set up optimizer parameters
+    // Define optimizer settings (e.g., AdamW hyperparameters)
+    struct ggml_opt_optimizer_params optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
+    optimizer_params.adamw.alpha = 1e-7f; // Example: Set learning rate
+    // TODO: Consider setting other AdamW params (beta1, beta2, eps, wd) from common_params if they are added there.
+
+    // Define LLaMA specific optimization parameters (which params to train, loss types, weights)
+    struct llama_opt_params lopt_params {
+        /*n_ctx_train     =*/ static_cast<uint32_t>(n_ctx_train),
+        /*param_filter    =*/ llama_opt_param_filter_all,
+        /*param_filter_ud =*/ nullptr,
+        /*get_opt_pars    =*/ ggml_opt_get_constant_optimizer_params, // Use constant HPs from optimizer_params
+        /*get_opt_pars_ud =*/ &optimizer_params,                     // Pass address of optimizer_params
+        /*loss_type_A     =*/ GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        /*loss_type_B     =*/ GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
+        /*loss_A_weight   =*/ 0.5f,
+        /*loss_B_weight   =*/ 0.5f,
+        /*outputs_B       =*/ nullptr // Not used by llama_opt_init
+    };
+
+    // Call llama_opt_init: This configures which model parameters are trainable
+    // and stores the loss types/weights into the llama_context.
+    // It no longer creates the ggml_opt_context.
+    llama_opt_init(ctx.get(), model.get(), lopt_params);
+
+    // Step 4 & 5: Initialize ggml_opt_context for actual training graph
     LOG_INF("%s: Initializing ggml_opt_context for dual loss training...\n", __func__);
 
-    struct ggml_opt_optimizer_params opt_hparams = ggml_opt_get_default_optimizer_params(nullptr);
-    // opt_hparams.adamw.alpha = 1e-7f; // Already set in lopt_params setup earlier, but this is where user can override
-    // opt_hparams from common_params could be used here, e.g., params.adam_alpha, etc.
-
-    // Retrieve loss settings stored in llama_context by llama_opt_init
-    // This requires accessors or making members public, assuming accessors for now:
-    // enum ggml_opt_loss_type loss_type_A = llama_context_get_train_loss_type_A(ctx.get());
-    // enum ggml_opt_loss_type loss_type_B = llama_context_get_train_loss_type_B(ctx.get());
-    // float loss_A_weight = llama_context_get_train_loss_A_weight(ctx.get());
-    // float loss_B_weight = llama_context_get_train_loss_B_weight(ctx.get());
-    // For this step, directly use what was in lopt_params, as they are the source.
-
     struct ggml_opt_params main_ggml_opt_params = ggml_opt_default_params(
-        nullptr, // backend_sched - This is problematic. See note below.
-                 // For non-static graphs, sched is primarily used in ggml_opt_build for ggml_backend_alloc_ctx_tensors.
-                 // If llama_context::opt_epoch_iter correctly passes its own sched via ggml_opt_prepare_alloc,
-                 // then passing nullptr here to ggml_opt_init might be acceptable if it's only stored and not used
-                 // until ggml_opt_build (which is called by ggml_opt_alloc, which is called by opt_epoch_iter).
-                 // This needs verification. For now, proceeding with nullptr and a note.
-                 // A safer way would be: llama_backend_sched_t internal_sched = llama_get_scheduler(ctx.get());
-                 // and pass internal_sched here. This requires adding llama_get_scheduler to LLaMA API.
+        nullptr, // backend_sched - see TODO below
         lopt_params.loss_type_A,
         lopt_params.loss_type_B
     );
@@ -231,66 +236,41 @@ int main(int argc, char ** argv) {
     main_ggml_opt_params.loss_A_weight = lopt_params.loss_A_weight;
     main_ggml_opt_params.loss_B_weight = lopt_params.loss_B_weight;
 
-    // Optimizer hyper-parameters (e.g. AdamW)
     main_ggml_opt_params.get_opt_pars = ggml_opt_get_constant_optimizer_params;
-    main_ggml_opt_params.get_opt_pars_ud = &opt_hparams; // Pass the struct itself
+    main_ggml_opt_params.get_opt_pars_ud = &optimizer_params; // Correctly point to the single optimizer_params instance
 
-    // Opt period (how many grad accumulations before an optimizer step)
-    // This needs to align with n_batch / n_ubatch from llama_context_params.
-    // For a token-based dataset, n_batch and n_ubatch from llama_context_params define physical batching.
-    // Let n_phys_batch = params.n_batch (from common_params, used for llama_context)
-    // Let n_phys_ubatch = params.n_ubatch
-    // opt_period should be n_logical_batch_size / n_physical_batch_size_for_grad_accum
-    // If we consider each token a "datapoint" for ggml_opt, and n_phys_ubatch is the actual GPU microbatch,
-    // then opt_period could be params.n_batch / params.n_ubatch.
     if (params.n_ubatch == 0 || params.n_batch % params.n_ubatch != 0) {
         LOG_ERR("%s: n_batch must be a multiple of n_ubatch, and n_ubatch > 0.\n", __func__);
         return 1;
     }
     main_ggml_opt_params.opt_period = params.n_batch / params.n_ubatch;
 
-
     // TODO: The backend_sched parameter for ggml_opt_default_params and subsequently for ggml_opt_init
     // is problematic as it's internal to llama_context. A proper solution would require
     // llama_context to expose its scheduler or assist in ggml_opt_context creation.
-    // For now, if ggml_opt_init with all null compute/graph params doesn't use the scheduler, this might pass.
-    // If it does, this will fail or misbehave. A placeholder ggml_backend_sched_t might be needed if NULL is not accepted.
-    // Let's try with a temporary CPU scheduler for init, assuming it's only for static graph related parts we are skipping.
-    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-    ggml_backend_sched_t temp_sched_for_init = ggml_backend_sched_new(&cpu_backend, nullptr, 1, 1, false, false);
+    // Using a temporary CPU scheduler for init, as it might only be strictly needed for static graph allocation.
+    ggml_backend_t cpu_backend_for_init = ggml_backend_cpu_init();
+    ggml_backend_sched_t temp_sched_for_init = ggml_backend_sched_new(&cpu_backend_for_init, nullptr, 1, 1, false, false);
     main_ggml_opt_params.backend_sched = temp_sched_for_init;
 
-
     ggml_opt_context_t main_opt_ctx = ggml_opt_init(main_ggml_opt_params);
+
+    ggml_backend_sched_free(temp_sched_for_init); // Free the temporary scheduler
+    ggml_backend_free(cpu_backend_for_init);      // Free the temporary backend
+
     if (!main_opt_ctx) {
         LOG_ERR("%s: Failed to initialize ggml_opt_context.\n", __func__);
-        ggml_backend_sched_free(temp_sched_for_init);
-        ggml_backend_free(cpu_backend);
         return 1;
     }
-    // The temp_sched_for_init is only for ggml_opt_init. The actual scheduler used during
-    // graph building and execution will be the one inside llama_context, passed via ggml_opt_prepare_alloc.
-    // So we can free it now.
-    ggml_backend_sched_free(temp_sched_for_init);
-    ggml_backend_free(cpu_backend);
-
 
     constexpr float val_split = 0.05f;
-    struct ggml_opt_optimizer_params optimizer_params = ggml_opt_get_default_optimizer_params(nullptr);
-    optimizer_params.adamw.alpha = 1e-7f; // learning rate
-
-    // This was the old lopt_params init, now settings are directly applied to main_ggml_opt_params
-    // The call to llama_opt_init(ctx.get(), model.get(), lopt_params) still happens to set trainable params
-    // and store loss config in llama_context, but it no longer creates ggml_opt_context.
-    opt_hparams.adamw.alpha = params.adam_alpha; // Use alpha from common_params
-    // Copy other relevant Adam params from common_params if needed: beta1, beta2, eps, wd
-
     const int64_t idata_split = n_total_trainable_tokens * (1.0f - val_split);
 
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
-    for (int epoch = 0; epoch < params.n_epochs; ++epoch) { // Use n_epochs from common_params
+    // Using a hardcoded number of epochs for now, as params.n_epochs is not in common_params
+    for (int epoch = 0; epoch < 2; ++epoch) {
         llama_opt_epoch(ctx.get(), main_opt_ctx, dataset, result_train, result_eval, idata_split,
             ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
         fprintf(stderr, "\n");

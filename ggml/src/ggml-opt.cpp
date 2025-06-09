@@ -543,10 +543,10 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     } else {
         // No valid loss calculated, create a zero loss to prevent graph errors
         // This case should ideally be handled by ensuring at least one loss weight > 0
-        float zero_val = 0.0f;
         opt_ctx->loss = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, 1);
-        ggml_set_f32(opt_ctx->loss, zero_val);
         ggml_set_name(opt_ctx->loss, "loss_zero");
+        float zero_value = 0.0f;
+        ggml_backend_tensor_set(opt_ctx->loss, &zero_value, 0, sizeof(float));
         opt_ctx->loss_per_datapoint = false;
     }
 
@@ -975,8 +975,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     // Let's assume result->ndata tracks total processed items, and loss.size() is number of batches so far for current result accumulation.
     // The logic should be: if result->ndata was 0 (start of new accumulation), then it's fine.
     // If result->ndata > 0, then previous batches must have had same ndata_from_batch size.
-    if (result->ndata > 0 && result->loss.size() > 0) { // Check if this is not the first batch for this result object
-         GGML_ASSERT(result->ndata / result->loss.size() == ndata_from_batch && "varying batch size not supported");
+    if (result->ndata > 0 && !result->loss.empty()) { // Check if this is not the first batch for this result object
+         GGML_ASSERT(result->ndata / (int64_t)result->loss.size() == ndata_from_batch && "varying batch size not supported");
     }
     result->ndata += ndata_from_batch;
 
@@ -988,7 +988,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
 
     if (opt_ctx->pred) {
         GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);
-        std::vector<int32_t> pred(ndata);
+        std::vector<int32_t> pred(ndata_from_batch); // Corrected variable name
         ggml_backend_tensor_get(opt_ctx->pred, pred.data(), 0, ggml_nbytes(opt_ctx->pred));
         result->pred.insert(result->pred.end(), pred.begin(), pred.end());
     }
@@ -1154,7 +1154,8 @@ void ggml_opt_fit(
     GGML_ASSERT(val_split >= 0.0f);
     GGML_ASSERT(val_split <  1.0f);
     const int64_t ibatch_split_logical = int64_t(((1.0f - val_split) * nbatches_logical));
-    const int64_t idata_split_items    = ibatch_split_logical * nbatch_logical; // This is the split point in terms of dataset items
+    // Renamed idata_split_items to idata_split_arg_for_epoch
+    const int64_t idata_split_arg_for_epoch = ibatch_split_logical * nbatch_logical;
 
     int64_t epoch = 1;
 
@@ -1182,8 +1183,9 @@ void ggml_opt_fit(
     ggml_opt_context_t opt_ctx = ggml_opt_init(params);
 
     // Shuffling the data is generally useful but there is only a point if not all data is used in a single batch.
+    // Initial shuffle of the entire dataset if it's larger than one logical batch.
     if (nbatch_logical < ndata_total_items_in_dataset) {
-        ggml_opt_dataset_shuffle(opt_ctx, dataset, -1); // Shuffle all data (train + validation).
+        ggml_opt_dataset_shuffle(opt_ctx, dataset, -1);
     }
 
     ggml_opt_result_t result_train = ggml_opt_result_init();
@@ -1192,9 +1194,20 @@ void ggml_opt_fit(
     ggml_opt_epoch_callback epoch_callback = silent ? nullptr : ggml_opt_epoch_callback_progress_bar;
 
     for (; epoch <= nepoch; ++epoch) {
-        if (nbatch_logical < idata_split) {
-            ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
+        // If the training data part (which could be the whole dataset if no validation split)
+        // is larger than one logical batch, then it should be shuffled.
+        // The initial shuffle (if nbatch_logical < ndata_total_items_in_dataset) handles the first epoch's full shuffle.
+        // For subsequent epochs, or if the training set is smaller than the full dataset but still multi-batch,
+        // this shuffles the training portion.
+        if (nbatch_logical < idata_split_arg_for_epoch) {
+            ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split_arg_for_epoch);
+        } else if (idata_split_arg_for_epoch == ndata_total_items_in_dataset && nbatch_logical < ndata_total_items_in_dataset && epoch > 1) {
+            // If the training set is the entire dataset, and it's multi-batch,
+            // re-shuffle the entire dataset for epochs after the first.
+            // The initial shuffle already handled epoch 1.
+            ggml_opt_dataset_shuffle(opt_ctx, dataset, -1); // Shuffle all
         }
+        // Note: If idata_split_arg_for_epoch is 0 (all validation), no shuffling happens here, which is correct.
 
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_val);
@@ -1202,7 +1215,8 @@ void ggml_opt_fit(
         if (!silent) {
             fprintf(stderr, "%s: epoch %04" PRId64 "/%04" PRId64 ":\n", __func__, epoch, nepoch);
         }
-        ggml_opt_epoch(opt_ctx, dataset, result_train, result_val, idata_split, epoch_callback, epoch_callback);
+        // Corrected call to use idata_split_arg_for_epoch
+        ggml_opt_epoch(opt_ctx, dataset, result_train, result_val, idata_split_arg_for_epoch, epoch_callback, epoch_callback);
         if (!silent) {
             fprintf(stderr, "\n");
         }

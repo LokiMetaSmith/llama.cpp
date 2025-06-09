@@ -2183,10 +2183,10 @@ void llama_context::opt_epoch(
     const uint32_t n_ctx    = this->n_ctx(); // This is llama_context::n_ctx(), not training n_ctx from model hparams
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
-    const  int64_t ndata    = ggml_opt_dataset_ndata(dataset);
+    const  int64_t ndata_total_items_in_dataset = ggml_opt_dataset_ndata(dataset); // Use this consistently
 
     GGML_ASSERT(idata_split >= 0);
-    GGML_ASSERT(idata_split <= ndata);
+    GGML_ASSERT(idata_split <= ndata_total_items_in_dataset); // Use this consistently
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
@@ -2202,18 +2202,18 @@ void llama_context::opt_epoch(
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
+        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), nullptr, idata);
         opt_epoch_iter(main_opt_ctx, dataset, result_train, tokens, labels_sparse, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
     t_loop_start = ggml_time_us();
-    ndata_in_loop = (ndata_total_items_in_dataset - idata_split)*ubatch_per_ctx; // Corrected ndata source
-    for (; idata < ndata_total_items_in_dataset; ++idata) { // Corrected loop limit
+    ndata_in_loop = (ndata_total_items_in_dataset - idata_split)*ubatch_per_ctx;
+    for (; idata < ndata_total_items_in_dataset; ++idata) {
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
+        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), nullptr, idata);
         opt_epoch_iter(main_opt_ctx, dataset, result_eval, tokens, labels_sparse, batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
