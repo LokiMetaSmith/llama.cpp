@@ -65,6 +65,7 @@ set(GGML_OPENCL_KERNELS
     gemv_noshuffle_general
     gemv_noshuffle
     get_rows
+    glu
     group_norm
     im2col_f32
     im2col_f16
@@ -80,12 +81,14 @@ set(GGML_OPENCL_KERNELS
     mul_mv_q4_0_f32_1d_8x_flat
     mul_mv_q4_0_f32_1d_16x_flat
     mul_mv_q6_k
+    mul_mv_id_q4_0_f32_8x_flat
     mul
     norm
     relu
     rms_norm
     rope
     scale
+    set_rows
     sigmoid
     silu
     softmax_4_f32
@@ -101,6 +104,7 @@ set(GGML_OPENCL_KERNELS
     tanh
     pad
     repeat
+    mul_mat_f16_f32
 )
 
 foreach (K ${GGML_OPENCL_KERNELS})
