@@ -14,7 +14,6 @@ struct hf_file {
     std::string final_path;
     std::string oid;
     std::string repo_id;
-    size_t size = 0; // only for the migration
 };
 
 using hf_files = std::vector<hf_file>;
@@ -30,7 +29,10 @@ hf_files get_cached_files(const std::string & repo_id = {});
 // Create snapshot path (link or move/copy) and return it
 std::string finalize_file(const hf_file & file);
 
-// TODO: Remove later
-void migrate_old_cache_to_hf_cache(const std::string & token, bool offline = false);
+// Remove the entire cached directory for a repo, returns true if removed
+bool remove_cached_repo(const std::string & repo_id);
+
+// Returns the HuggingFace hub cache path
+std::string get_cache_path();
 
 } // namespace hf_cache

@@ -4,6 +4,7 @@
 #include "common.h"
 #include "jinja/caps.h"
 #include "peg-parser.h"
+#include "json.h"
 
 #include <chrono>
 #include <optional>
@@ -11,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-using json = nlohmann::ordered_json;
+using json = common_json;
 
 class common_chat_peg_builder;
 
@@ -59,16 +60,21 @@ struct generation_params {
     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_AUTO;
     bool                                  stream              = true;
     std::string                           grammar;
-    bool                                  add_generation_prompt = false;
-    bool                                  enable_thinking       = true;
-    std::chrono::system_clock::time_point now                   = std::chrono::system_clock::now();
-    std::string                           generation_prompt;
+    bool                                  add_generation_prompt  = false;
+    common_chat_continuation              continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+    common_chat_msg                       continue_msg;
+    bool                                  enable_thinking        = true;
+    std::chrono::system_clock::time_point now                    = std::chrono::system_clock::now();
     json                                  extra_context;
     bool                                  add_bos       = false;
     bool                                  add_eos       = false;
     bool                                  is_inference  = true;
     bool                                  add_inference = false;
     bool                                  mark_input    = true;  // whether to mark input strings in the jinja context
+
+    bool has_continuation() const {
+        return continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !continue_msg.empty();
+    }
 };
 
 // ============================================================================
@@ -144,7 +150,6 @@ enum class tool_format {
     JSON_NATIVE,      // Pure JSON: {"name": "X", "arguments": {...}}
     TAG_WITH_JSON,    // Tag-based with JSON args: <function=X>{...}</function>
     TAG_WITH_TAGGED,  // Tag-based with tagged args: <param=key>value</param>
-    TAG_WITH_GEMMA4_DICT, // Gemma4 custom dict: <|tool_call>call:name{key:<|"|>val<|"|>}<tool_call|>
 };
 
 inline std::ostream & operator<<(std::ostream & os, const tool_format & format) {
@@ -157,8 +162,6 @@ inline std::ostream & operator<<(std::ostream & os, const tool_format & format) 
             return os << "TAG_WITH_JSON";
         case tool_format::TAG_WITH_TAGGED:
             return os << "TAG_WITH_TAGGED";
-        case tool_format::TAG_WITH_GEMMA4_DICT:
-            return os << "TAG_WITH_GEMMA4_DICT";
         default:
             return os << "UNKNOWN";
     }
@@ -178,6 +181,7 @@ struct tool_format_analysis {
 
     bool fun_name_is_key = false;       // In JSON format function name is JSON key, i.e. { "<funname>": { ... arguments ... } }
     bool tools_array_wrapped = false;   // Tool calls wrapped in JSON array [...]
+    bool openai_wrapper_trigger = false;  // model emits the OpenAI function wrapper, trigger on it
 
     std::string              function_field = "function";
     std::string              name_field     = "name";
@@ -188,9 +192,10 @@ struct tool_format_analysis {
 };
 
 struct tool_function_analysis {
-    std::string name_prefix;  // e.g., "<function=", "\"name\": \"", "functions."
-    std::string name_suffix;  // e.g., ">", "\"", ":0"
-    std::string close;        // e.g., "</function>", "" (for tag-based)
+    std::string name_prefix;     // e.g., "<function=", "\"name\": \"", "functions."
+    std::string name_suffix;     // e.g., ">", "\"", ":0"
+    std::string args_separator;  // e.g., "<tool_sep>" (marker between function name and arguments)
+    std::string close;           // e.g., "</function>", "" (for tag-based)
 };
 
 struct tool_arguments_analysis {
@@ -201,6 +206,7 @@ struct tool_arguments_analysis {
     std::string value_prefix;  // e.g., "", "<arg_value>", ""
     std::string value_suffix;  // e.g., "</param>", "</arg_value>", ""
     std::string separator;     // e.g., "", "\n", ","
+    bool tolerate_intertag_whitespace = false; // Laguna: accept optional whitespace between arg tags
 };
 
 struct tool_id_analysis {
@@ -215,12 +221,14 @@ struct tool_id_analysis {
 // ============================================================================
 
 struct analyze_content;
+struct analyze_reasoning;
 
 struct parser_build_context {
     common_chat_peg_builder & p;
-    const generation_params &          inputs;
+    const generation_params &         inputs;
     common_peg_parser                 reasoning_parser;
     bool                              extracting_reasoning = false;
+    const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;
 
     parser_build_context(common_chat_peg_builder & p, const generation_params & inputs);
@@ -308,18 +316,22 @@ struct analyze_tools : analyze_base {
 
   private:
     // Extract tool calling 'haystack' for further analysis and delegate further analysis based on format
-    void analyze_tool_calls(const analyze_reasoning & reasoning);
+    void analyze_tool_calls(const analyze_reasoning & reasoning, bool supports_parallel_tool_calls);
 
     // Analyze format based on position of function and argument name in needle
     void analyze_tool_call_format(const std::string &       haystack,
                                   const std::string &       fun_name_needle,
                                   const std::string &       arg_name_needle,
-                                  const analyze_reasoning & reasoning);
+                                  const analyze_reasoning & reasoning,
+                                  bool                      supports_parallel_tool_calls);
 
     // Analyze specifics of JSON native format (entire tool call is a JSON object)
     void analyze_tool_call_format_json_native(const std::string & clean_haystack,
                                               const std::string & fun_name_needle,
                                               const std::string & arg_name_needle);
+
+    // Check if parallel calls in JSON native format array wrapped or tag wrapped
+    void analyze_json_native_parallel_calls();
 
     // Analyze specifics of non-JSON native format (tags for function name or for function name and arguments)
     void analyze_tool_call_format_non_json(const std::string & clean_haystack,
@@ -353,7 +365,13 @@ struct analyze_tools : analyze_base {
     common_peg_parser build_tool_parser_json_native(parser_build_context & ctx) const;
     common_peg_parser build_tool_parser_tag_json(parser_build_context & ctx) const;
     common_peg_parser build_tool_parser_tag_tagged(parser_build_context & ctx) const;
-    common_peg_parser build_tool_parser_tag_gemma4_dict(parser_build_context & ctx) const;
+
+    // Shared helper: builds func_parser from open+call_id+args, handling atomic wrapping and close.
+    // atomic_peek: if present, used as the peek expression in the third atomicity branch.
+    common_peg_parser build_func_parser(common_chat_peg_builder & p, const std::string & name,
+                                        const common_peg_parser & call_id_section, bool have_call_id,
+                                        const common_peg_parser & args,
+                                        std::optional<common_peg_parser> atomic_peek) const;
 };
 
 // ============================================================================
@@ -362,6 +380,8 @@ struct analyze_tools : analyze_base {
 
 struct autoparser {
     jinja::caps          jinja_caps;
+    std::string          user_start;
+    std::string          assistant_start;
     analyze_reasoning    reasoning;
     analyze_content      content;
     analyze_tools        tools;
@@ -369,14 +389,19 @@ struct autoparser {
 
     // Preserved tokens for tokenizer (union of all non-empty markers)
     std::vector<std::string> preserved_tokens;
+    std::vector<std::string> additional_stops;  // literal stop strings (e.g. Laguna </assistant>) caught however tokenized
 
     autoparser() = default;
+
+    // Find the starting marker for the user message and assistant message
+    std::string detect_user_start_marker(const common_chat_template & tmpl);
+    std::string detect_assistant_start_marker(const common_chat_template & tmpl);
 
     // Run full differential analysis on a template
     void analyze_template(const common_chat_template & tmpl);
 
     // Build the PEG parser for this template
-    common_peg_arena build_parser(const generation_params & inputs) const;
+    common_peg_arena build_parser(const generation_params & inputs, const std::string & generation_prompt) const;
 
   private:
     // Collect tokens from entire analysis to preserve
